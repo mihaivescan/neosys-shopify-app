@@ -15,5 +15,8 @@
     "node-fetch": "^3.3.2",
     "pg": "^8.19.0",
     "typescript": "^5.5.4"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.18.0"
   }
 }
