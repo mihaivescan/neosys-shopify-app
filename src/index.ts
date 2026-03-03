@@ -28,6 +28,12 @@ initDb().catch(console.error);
 const app = express();
 app.use(express.json());
 
+app.get("/", (req, res) => {
+  const shop = String(req.query.shop || "");
+  if (!shop) return res.status(200).send("OK (missing ?shop=...)");
+  return res.redirect(`/auth?shop=${encodeURIComponent(shop)}`);
+});
+
 // env
 const APP_URL = process.env.APP_URL!;
 const SHOPIFY_API_KEY = process.env.SHOPIFY_API_KEY!;
