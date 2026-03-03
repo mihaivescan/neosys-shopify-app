@@ -1,5 +1,10 @@
 import crypto from "crypto";
 import fetch from "node-fetch";
+import express from "express";
+import type { Request, Response } from "express";
+
+const app = express();
+app.use(express.json());
 
 // env
 const APP_URL = process.env.APP_URL!;
@@ -25,13 +30,19 @@ function verifyHmacFromQuery(query: Record<string, string>) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
 }
 
+// health (util pentru Render)
+app.get("/health", (_req: Request, res: Response) => res.status(200).send("ok"));
+
 // 1) START OAUTH
-app.get("/auth", (req, res) => {
+app.get("/auth", (req: Request, res: Response) => {
   const shop = String(req.query.shop || "").trim();
   if (!shop.endsWith(".myshopify.com")) return res.status(400).send("Invalid shop");
 
   const state = crypto.randomBytes(16).toString("hex");
   const redirectUri = `${APP_URL}/auth/callback`;
+
+  // IMPORTANT: aici ar trebui să salvezi state (cookie/db) ca să-l verifici în callback.
+  // Momentan îl trimiți dar nu îl validezi (doar verifici că există).
 
   const installUrl =
     `https://${shop}/admin/oauth/authorize` +
@@ -44,7 +55,7 @@ app.get("/auth", (req, res) => {
 });
 
 // 2) CALLBACK OAUTH
-app.get("/auth/callback", async (req, res) => {
+app.get("/auth/callback", async (req: Request, res: Response) => {
   const shop = String(req.query.shop || "");
   const code = String(req.query.code || "");
   const hmac = String(req.query.hmac || "");
@@ -79,4 +90,10 @@ app.get("/auth/callback", async (req, res) => {
   // ex: await saveToken(shop, accessToken);
 
   return res.send("✅ Installed OK. Token obtained (not yet saved).");
+});
+
+// ✅ FOARTE IMPORTANT pentru Render
+const PORT = Number(process.env.PORT || 3000);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
 });
