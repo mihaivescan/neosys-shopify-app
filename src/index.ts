@@ -112,7 +112,8 @@ app.get("/auth/callback", async (req: Request, res: Response) => {
   }
 
   const tokenJson = (await tokenResp.json()) as { access_token: string; scope: string };
-  const accessToken = tokenJson.access_token;
+  const accessToken = tokenJson.access_token; 
+console.log("SHOPIFY ACCESS TOKEN =", accessToken);
 
   await pool.query(
   `
