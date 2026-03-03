@@ -2,6 +2,28 @@ import crypto from "crypto";
 import fetch from "node-fetch";
 import express from "express";
 import type { Request, Response } from "express";
+import { Pool } from "pg";
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shops (
+      shop TEXT PRIMARY KEY,
+      access_token TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  console.log("DB initialized");
+}
+
+initDb().catch(console.error);
 
 const app = express();
 app.use(express.json());
@@ -86,8 +108,17 @@ app.get("/auth/callback", async (req: Request, res: Response) => {
   const tokenJson = (await tokenResp.json()) as { access_token: string; scope: string };
   const accessToken = tokenJson.access_token;
 
-  // TODO: aici salvezi in Postgres tokenul pentru shop
-  // ex: await saveToken(shop, accessToken);
+  await pool.query(
+  `
+  INSERT INTO shops (shop, access_token)
+  VALUES ($1, $2)
+  ON CONFLICT (shop)
+  DO UPDATE SET
+    access_token = EXCLUDED.access_token,
+    updated_at = NOW();
+  `,
+  [shop, accessToken]
+);
 
   return res.send("✅ Installed OK. Token obtained (not yet saved).");
 });
