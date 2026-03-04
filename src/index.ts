@@ -336,8 +336,19 @@ app.get("/auth/callback", async (req, res) => {
 // =====================
 function verifyWebhookHmac(rawBody: Buffer, hmacHeader: string | undefined) {
   if (!hmacHeader) return false;
-  const digest = base64Hmac(SHOPIFY_API_SECRET!, rawBody);
-  return safeCompare(digest, hmacHeader);
+
+  // Shopify sends base64(HMAC_SHA256(secret, rawBody)) in X-Shopify-Hmac-Sha256
+  const computed = crypto.createHmac("sha256", SHOPIFY_API_SECRET!).update(rawBody).digest(); // Buffer (32 bytes)
+
+  let received: Buffer;
+  try {
+    received = Buffer.from(hmacHeader, "base64");
+  } catch {
+    return false;
+  }
+
+  if (received.length !== computed.length) return false;
+  return crypto.timingSafeEqual(received, computed);
 }
 
 function webhookEndpoint(
