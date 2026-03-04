@@ -1,59 +1,47 @@
-import express, { Request, Response } from "express";
+import express from "express";
 import crypto from "crypto";
-import fetch from "node-fetch";
+import dotenv from "dotenv";
 import { Pool } from "pg";
+
+dotenv.config();
 
 const app = express();
 
-// Shopify webhooks need raw body to verify HMAC
-app.use(
-  "/webhooks",
-  express.raw({
-    type: "*/*",
-  })
-);
+// --- ENV ---
+const {
+  PORT = "3000",
+  SHOPIFY_API_KEY,
+  SHOPIFY_API_SECRET,
+  SHOPIFY_SCOPES = "read_products,write_products,read_orders,write_orders,write_fulfillments",
+  SHOPIFY_APP_URL,           // ex: https://neosys-shopify-app.onrender.com
+  DATABASE_URL,
 
-// For normal routes
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+  // optional (dacă vrei să forțezi un shop la test)
+  DEFAULT_SHOP
+} = process.env;
 
-const APP_URL = mustEnv("APP_URL"); // e.g. https://neosys-shopify-app.onrender.com
-const SHOPIFY_API_KEY = mustEnv("SHOPIFY_API_KEY");
-const SHOPIFY_API_SECRET = mustEnv("SHOPIFY_API_SECRET");
-const SHOPIFY_WEBHOOK_SECRET = mustEnv("SHOPIFY_WEBHOOK_SECRET"); // usually same as SHOPIFY_API_SECRET
-const SCOPES = mustEnv("SCOPES"); // comma separated: read_orders,write_products,...
+if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET || !SHOPIFY_APP_URL || !DATABASE_URL) {
+  console.error("Missing env. Required: SHOPIFY_API_KEY, SHOPIFY_API_SECRET, SHOPIFY_APP_URL, DATABASE_URL");
+  process.exit(1);
+}
 
+// --- DB ---
 const pool = new Pool({
-  connectionString: mustEnv("DATABASE_URL"),
-  ssl: process.env.DATABASE_URL?.includes("render.com") ? { rejectUnauthorized: false } : undefined,
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false } // Render Postgres
 });
 
-async function ensureDb() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS shopify_tokens (
-      shop TEXT PRIMARY KEY,
-      access_token TEXT NOT NULL,
-      installed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
+// --- Helpers ---
+function timingSafeEqual(a: string, b: string) {
+  const aa = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  if (aa.length !== bb.length) return false;
+  return crypto.timingSafeEqual(aa, bb);
 }
 
-// ---------- Helpers ----------
-function mustEnv(key: string): string {
-  const v = process.env[key];
-  if (!v) throw new Error(`Missing env var: ${key}`);
-  return v;
-}
-
-function safeEqual(a: string, b: string) {
-  const ba = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ba.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ba, bb);
-}
-
-function verifyOAuthHmac(query: Record<string, any>): boolean {
-  const { hmac, signature, ...rest } = query;
+function verifyShopifyHmacFromQuery(query: Record<string, any>): boolean {
+  // Shopify OAuth redirect: query includes hmac + rest params
+  const { hmac, signature, ...rest } = query as any;
   if (!hmac) return false;
 
   const message = Object.keys(rest)
@@ -61,255 +49,178 @@ function verifyOAuthHmac(query: Record<string, any>): boolean {
     .map((k) => `${k}=${Array.isArray(rest[k]) ? rest[k].join(",") : rest[k]}`)
     .join("&");
 
-  const digest = crypto.createHmac("sha256", SHOPIFY_API_SECRET).update(message).digest("hex");
-  return safeEqual(digest, String(hmac));
+  const digest = crypto
+    .createHmac("sha256", SHOPIFY_API_SECRET!)
+    .update(message)
+    .digest("hex");
+
+  return timingSafeEqual(digest, String(hmac));
 }
 
 function verifyWebhookHmac(rawBody: Buffer, hmacHeader: string | undefined): boolean {
   if (!hmacHeader) return false;
-  const digest = crypto.createHmac("sha256", SHOPIFY_WEBHOOK_SECRET).update(rawBody).digest("base64");
-  return safeEqual(digest, hmacHeader);
+
+  const digest = crypto
+    .createHmac("sha256", SHOPIFY_API_SECRET!)
+    .update(rawBody)
+    .digest("base64");
+
+  return timingSafeEqual(digest, hmacHeader);
 }
 
-async function saveToken(shop: string, token: string) {
-  await pool.query(
-    `INSERT INTO shopify_tokens (shop, access_token)
-     VALUES ($1, $2)
-     ON CONFLICT (shop) DO UPDATE SET access_token = EXCLUDED.access_token, installed_at = NOW()`,
-    [shop, token]
-  );
+async function ensureTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_tokens (
+      shop TEXT PRIMARY KEY,
+      access_token TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 }
+ensureTables().catch((e) => console.error("DB init error:", e));
 
-async function getToken(shop: string): Promise<string | null> {
-  const r = await pool.query(`SELECT access_token FROM shopify_tokens WHERE shop=$1`, [shop]);
-  return r.rows?.[0]?.access_token ?? null;
-}
-
-async function shopifyGraphQL(shop: string, accessToken: string, query: string, variables?: any) {
-  const res = await fetch(`https://${shop}/admin/api/2026-01/graphql.json`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": accessToken,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const json = await res.json();
-  if (!res.ok) {
-    throw new Error(`Shopify GraphQL HTTP ${res.status}: ${JSON.stringify(json)}`);
-  }
-  if (json.errors?.length) {
-    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
-  }
-  return json.data;
-}
-
-// Create or ensure webhook subscription for topic + callback
-async function ensureWebhook(shop: string, accessToken: string, topic: string, callbackUrl: string) {
-  // Try to find existing subscription with same topic+callback (best-effort)
-  const listQ = `
-    query ListWebhooks($first:Int!) {
-      webhookSubscriptions(first:$first) {
-        edges {
-          node {
-            id
-            topic
-            endpoint {
-              __typename
-              ... on WebhookHttpEndpoint { callbackUrl }
-            }
-          }
-        }
-      }
-    }
-  `;
-  const data = await shopifyGraphQL(shop, accessToken, listQ, { first: 100 });
-  const edges = data.webhookSubscriptions.edges as any[];
-  const exists = edges.find((e) => {
-    const n = e.node;
-    const cb = n.endpoint?.callbackUrl;
-    return n.topic === topic && cb === callbackUrl;
-  });
-
-  if (exists) return { id: exists.node.id, created: false };
-
-  const createQ = `
-    mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $callbackUrl: URL!) {
-      webhookSubscriptionCreate(
-        topic: $topic
-        webhookSubscription: { callbackUrl: $callbackUrl, format: JSON }
-      ) {
-        webhookSubscription { id topic }
-        userErrors { field message }
-      }
-    }
-  `;
-
-  const created = await shopifyGraphQL(shop, accessToken, createQ, {
-    topic,
-    callbackUrl,
-  });
-
-  const errs = created.webhookSubscriptionCreate.userErrors;
-  if (errs?.length) {
-    throw new Error(`Webhook create userErrors: ${JSON.stringify(errs)}`);
-  }
-
-  return { id: created.webhookSubscriptionCreate.webhookSubscription.id, created: true };
-}
-
-async function registerWebhooks(shop: string, accessToken: string) {
-  // ✅ topic-uri safe/uzuale
-  const hooks = [
-    { topic: "ORDERS_CREATE", path: "/webhooks/orders_create" },
-    { topic: "ORDERS_PAID", path: "/webhooks/orders_paid" },
-
-    // ✅ pentru fulfillment:
-    { topic: "FULFILLMENTS_CREATE", path: "/webhooks/fulfillments_create" },
-  ];
-
-  for (const h of hooks) {
-    const url = `${APP_URL}${h.path}`;
-    const res = await ensureWebhook(shop, accessToken, h.topic, url);
-    console.log(`✅ Webhook ensured: ${h.topic} -> ${url} (id=${res.id})`);
-  }
-}
-
-// ---------- Routes ----------
-app.get("/", (_req: Request, res: Response) => {
+// --- Basic ---
+app.get("/", (_req, res) => {
   res.status(200).send("OK");
 });
 
-// start OAuth
-app.get("/auth", async (req: Request, res: Response) => {
-  const shop = String(req.query.shop || "").trim();
+// --- OAuth start ---
+// GET /auth?shop=xxx.myshopify.com
+app.get("/auth", (req, res) => {
+  const shop = (req.query.shop as string) || DEFAULT_SHOP;
+  if (!shop) return res.status(400).send("Missing shop");
+
+  // state random (poți salva și în DB/session; pentru simplu demo îl lăsăm fix sau random)
   const state = crypto.randomBytes(16).toString("hex");
 
-  if (!shop || !shop.endsWith(".myshopify.com")) {
-    return res.status(400).send("Missing or invalid shop");
-  }
-
-  // Minimal: redirect to Shopify OAuth
-  const redirectUri = `${APP_URL}/auth/callback`;
+  const redirectUri = `${SHOPIFY_APP_URL}/auth/callback`;
   const installUrl =
     `https://${shop}/admin/oauth/authorize` +
-    `?client_id=${encodeURIComponent(SHOPIFY_API_KEY)}` +
-    `&scope=${encodeURIComponent(SCOPES)}` +
+    `?client_id=${SHOPIFY_API_KEY}` +
+    `&scope=${encodeURIComponent(SHOPIFY_SCOPES)}` +
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-    `&state=${encodeURIComponent(state)}`;
+    `&state=${state}`;
 
-  // In production store "state" per shop (db/redis). For now, just pass through.
-  res.redirect(installUrl);
+  return res.redirect(installUrl);
 });
 
-app.get("/auth/callback", async (req: Request, res: Response) => {
+// --- OAuth callback ---
+// Shopify hits: /auth/callback?code=...&shop=...&hmac=...&state=...
+app.get("/auth/callback", async (req, res) => {
   try {
-    const shop = String(req.query.shop || "").trim();
-    const code = String(req.query.code || "").trim();
+    if (!verifyShopifyHmacFromQuery(req.query as any)) {
+      return res.status(400).send("Invalid HMAC");
+    }
 
+    const shop = String(req.query.shop || "");
+    const code = String(req.query.code || "");
     if (!shop || !code) return res.status(400).send("Missing shop or code");
-    if (!verifyOAuthHmac(req.query as any)) return res.status(401).send("Invalid HMAC");
 
-    const tokenRes = await fetch(`https://${shop}/admin/oauth/access_token`, {
+    const tokenResp = await fetch(`https://${shop}/admin/oauth/access_token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         client_id: SHOPIFY_API_KEY,
         client_secret: SHOPIFY_API_SECRET,
-        code,
-      }),
+        code
+      })
     });
 
-    const tokenJson: any = await tokenRes.json();
-    if (!tokenRes.ok) {
-      throw new Error(`Token exchange failed: ${tokenRes.status} ${JSON.stringify(tokenJson)}`);
+    if (!tokenResp.ok) {
+      const txt = await tokenResp.text();
+      console.error("Token exchange failed:", tokenResp.status, txt);
+      return res.status(500).send("Token exchange failed");
     }
 
-    const accessToken = tokenJson.access_token as string;
-    await ensureDb();
-    await saveToken(shop, accessToken);
+    // TS18046 fix: cast
+    const tokenJson = (await tokenResp.json()) as any;
+    const accessToken: string | undefined = tokenJson.access_token;
 
-    console.log(`✅ Token saved for ${shop}. Registering webhooks...`);
-    await registerWebhooks(shop, accessToken);
+    if (!accessToken) {
+      console.error("No access_token in response:", tokenJson);
+      return res.status(500).send("No access token");
+    }
 
-    res.status(200).send("Installed OK. Token obtained & saved. Webhooks registered.");
+    // save token
+    await pool.query(
+      `INSERT INTO shop_tokens (shop, access_token) VALUES ($1,$2)
+       ON CONFLICT (shop) DO UPDATE SET access_token=EXCLUDED.access_token, updated_at=NOW()`,
+      [shop, accessToken]
+    );
+
+    console.log(`✅ Installed OK. Token saved for ${shop}`);
+
+    // auto-register webhooks
+    await registerWebhooks(shop, accessToken).catch((e) => {
+      console.error("Webhook registration error:", e);
+    });
+
+    return res.status(200).send("Installed OK. Token saved. Webhooks registered.");
   } catch (e: any) {
-    console.error("Auth callback error:", e?.message || e);
-    res.status(500).send(`Auth callback error: ${e?.message || "unknown"}`);
+    console.error("Callback error:", e);
+    return res.status(500).send("Callback error");
   }
 });
 
-// ---------- Webhooks ----------
-app.post("/webhooks/orders_create", async (req: Request, res: Response) => {
+// --- Webhook receiver (raw body for HMAC verification) ---
+app.post("/webhooks/orders_create", express.raw({ type: "application/json" }), (req, res) => {
   try {
-    const hmac = req.header("X-Shopify-Hmac-Sha256") || undefined;
-    const shop = req.header("X-Shopify-Shop-Domain") || "unknown";
+    const hmacHeader = req.get("X-Shopify-Hmac-Sha256") || undefined;
+    const ok = verifyWebhookHmac(req.body as Buffer, hmacHeader);
 
-    const raw = req.body as Buffer;
-    if (!verifyWebhookHmac(raw, hmac)) return res.status(401).send("Invalid webhook HMAC");
+    if (!ok) {
+      console.warn("❌ Webhook HMAC failed");
+      return res.status(401).send("Invalid webhook signature");
+    }
 
-    const payload = JSON.parse(raw.toString("utf8"));
+    const topic = req.get("X-Shopify-Topic");
+    const shop = req.get("X-Shopify-Shop-Domain");
 
-    // Aici detectezi COD, dacă vrei:
-    // - payload.gateway / payment_gateway_names
-    // - payload.financial_status
-    // Exemplu:
-    // const gateways = (payload.payment_gateway_names || []).join(",").toLowerCase();
-    // const isCod = gateways.includes("cash") || gateways.includes("cod");
+    const payloadStr = (req.body as Buffer).toString("utf8");
+    const payload = JSON.parse(payloadStr);
 
-    console.log("📦 ORDERS_CREATE", shop, payload?.id, payload?.name);
-    res.status(200).send("ok");
-  } catch (e: any) {
-    console.error("orders_create webhook error:", e?.message || e);
-    res.status(500).send("error");
+    console.log("✅ Webhook received:", { topic, shop, order_id: payload?.id });
+
+    // TODO: aici trimiți în NeoSys / ERP sau salvezi în DB
+    return res.status(200).send("ok");
+  } catch (e) {
+    console.error("Webhook handler error:", e);
+    return res.status(200).send("ok"); // Shopify vrea 200 rapid
   }
 });
 
-app.post("/webhooks/orders_paid", async (req: Request, res: Response) => {
-  try {
-    const hmac = req.header("X-Shopify-Hmac-Sha256") || undefined;
-    const shop = req.header("X-Shopify-Shop-Domain") || "unknown";
-    const raw = req.body as Buffer;
+// --- Register webhooks via Admin REST ---
+async function registerWebhooks(shop: string, accessToken: string) {
+  const webhookAddress = `${SHOPIFY_APP_URL}/webhooks/orders_create`;
 
-    if (!verifyWebhookHmac(raw, hmac)) return res.status(401).send("Invalid webhook HMAC");
+  // orders/create exemplu (poți adăuga și altele)
+  const body = {
+    webhook: {
+      topic: "orders/create",
+      address: webhookAddress,
+      format: "json"
+    }
+  };
 
-    const payload = JSON.parse(raw.toString("utf8"));
-    console.log("💰 ORDERS_PAID", shop, payload?.id, payload?.name);
-
-    res.status(200).send("ok");
-  } catch (e: any) {
-    console.error("orders_paid webhook error:", e?.message || e);
-    res.status(500).send("error");
-  }
-});
-
-app.post("/webhooks/fulfillments_create", async (req: Request, res: Response) => {
-  try {
-    const hmac = req.header("X-Shopify-Hmac-Sha256") || undefined;
-    const shop = req.header("X-Shopify-Shop-Domain") || "unknown";
-    const raw = req.body as Buffer;
-
-    if (!verifyWebhookHmac(raw, hmac)) return res.status(401).send("Invalid webhook HMAC");
-
-    const payload = JSON.parse(raw.toString("utf8"));
-    console.log("🚚 FULFILLMENTS_CREATE", shop, payload?.id);
-
-    res.status(200).send("ok");
-  } catch (e: any) {
-    console.error("fulfillments_create webhook error:", e?.message || e);
-    res.status(500).send("error");
-  }
-});
-
-// ---------- Start ----------
-const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-
-ensureDb()
-  .then(() => {
-    app.listen(PORT, () => console.log(`✅ Server listening on ${PORT}`));
-  })
-  .catch((e) => {
-    console.error("DB init failed:", e);
-    process.exit(1);
+  const resp = await fetch(`https://${shop}/admin/api/2025-07/webhooks.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": accessToken
+    },
+    body: JSON.stringify(body)
   });
+
+  const txt = await resp.text();
+  if (!resp.ok) {
+    console.error("❌ Webhook create failed:", resp.status, txt);
+    return;
+  }
+
+  console.log("✅ Webhook registered:", txt);
+}
+
+// --- Start ---
+app.listen(Number(PORT), () => {
+  console.log(`Server running on port ${PORT}`);
+});
