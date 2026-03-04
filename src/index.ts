@@ -345,9 +345,9 @@ function webhookEndpoint(
   handler: (topic: string, shop: string, payload: any) => Promise<void>
 ) {
   return [
-    express.raw({ type: "application/json", limit: "5mb" }),
+    express.raw({ type: "*/*", limit: "5mb" }),
     async (req: Request, res: Response) => {
-      const hmac = req.header("X-Shopify-Hmac-Sha256") || undefined;
+      const hmac = (req.header("X-Shopify-Hmac-Sha256") || "").trim() || undefined;
       const topic = req.header("X-Shopify-Topic") || "";
       const shop = req.header("X-Shopify-Shop-Domain") || "";
       const webhookId = req.header("X-Shopify-Webhook-Id") || "";
