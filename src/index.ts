@@ -627,6 +627,22 @@ ${articoleXml}
 // =====================
 // NeoSys actions
 // =====================
+async function hasNeoSysOrderMapping(shop: string, shopifyOrderId: number): Promise<boolean> {
+  const res = await pool.query(
+    `
+    select 1
+    from neosys_order_map
+    where shop = $1
+    and shopify_order_id = $2
+    limit 1
+    `,
+    [shop, shopifyOrderId]
+  );
+
+  return res.rowCount > 0;
+}
+
+
 async function createNeoSysOrder(shop: string, order: any) {
   const xml = mapOrderToNeoSysXml(order);
   const resp = await neosysPost("/comanda_client", xml);
