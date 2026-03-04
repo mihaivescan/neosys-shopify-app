@@ -639,7 +639,7 @@ async function hasNeoSysOrderMapping(shop: string, shopifyOrderId: number): Prom
     [shop, shopifyOrderId]
   );
 
-  return res.rowCount > 0;
+  return (res.rowCount ?? 0) > 0;
 }
 
 
