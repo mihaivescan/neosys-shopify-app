@@ -157,8 +157,7 @@ type WebhookTopic =
   | "orders/create"
   | "orders/paid"
   | "orders/cancelled"
-  | "orders/fulfilled"
-  | "orders/partially_fulfilled"
+  | "fulfillments/create"
   | "products/update"
   | "products/create";
 
@@ -166,8 +165,7 @@ const WEBHOOKS: Array<{ topic: WebhookTopic; path: string }> = [
   { topic: "orders/create", path: "/webhooks/orders_create" },
   { topic: "orders/paid", path: "/webhooks/orders_paid" },
   { topic: "orders/cancelled", path: "/webhooks/orders_cancelled" },
-  { topic: "orders/fulfilled", path: "/webhooks/orders_fulfilled" },
-  { topic: "orders/partially_fulfilled", path: "/webhooks/orders_partially_fulfilled" },
+  { topic: "fulfillments/create", path: "/webhooks/fulfillments_create" },
   { topic: "products/update", path: "/webhooks/products_update" },
   { topic: "products/create", path: "/webhooks/products_create" },
 ];
@@ -706,8 +704,16 @@ app.post(
 app.post(
   "/webhooks/orders_paid",
   ...webhookEndpoint("orders_paid", async (_topic, shop, payload) => {
-    // optional: update status in NeoSys (not implemented)
-    console.log(`[neosys] orders/paid received. shop=${shop} order_id=${payload?.id}`);
+    const orderId = Number(payload?.id);
+    console.log(`[neosys] orders/paid received. shop=${shop} order_id=${orderId}`);
+
+    // Recommended: create ERP order on paid to avoid unpaid/abandoned orders.
+    if (orderId && await hasNeoSysOrderMapping(shop, orderId)) {
+      console.log(`[neosys] orders/paid ignored (already mapped). shop=${shop} order_id=${orderId}`);
+      return;
+    }
+
+    await createNeoSysOrder(shop, payload);
   })
 );
 
@@ -720,18 +726,9 @@ app.post(
 );
 
 app.post(
-  "/webhooks/orders_fulfilled",
-  ...webhookEndpoint("orders_fulfilled", async (_topic, shop, payload) => {
-    // Shopify topic: orders/fulfilled
-    console.log(`[neosys] orders/fulfilled received. shop=${shop} order_id=${payload?.id}`);
-  })
-);
-
-app.post(
-  "/webhooks/orders_partially_fulfilled",
-  ...webhookEndpoint("orders_partially_fulfilled", async (_topic, shop, payload) => {
-    // Shopify topic: orders/partially_fulfilled
-    console.log(`[neosys] orders/partially_fulfilled received. shop=${shop} order_id=${payload?.id}`);
+  "/webhooks/fulfillments_create",
+  ...webhookEndpoint("fulfillments_create", async (_topic, shop, payload) => {
+    console.log(`[neosys] fulfillments/create received. shop=${shop} fulfillment_id=${payload?.id}`);
   })
 );
 
