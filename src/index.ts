@@ -44,10 +44,7 @@ if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET || !SHOPIFY_SCOPES || !SHOPIFY_APP_U
 }
 
 // NeoSys envs are optional at boot; required only when you actually call NeoSys.
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
+const pool = new Pool({ connectionString: DATABASE_URL });
 
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
@@ -388,7 +385,7 @@ function requireNeoSysEnv() {
   if (!NEOSYS_AUTHORIZATION) throw new Error("Missing NEOSYS_AUTHORIZATION (full Authorization header value)");
 }
 
-async function neosysPost(path: string, xmlBody: string): Promise<{ status: number; raw: string; parsed: any }> {
+async function neosysPost(path: string, xmlBody: string, options?: { parseXml?: boolean }): Promise<{ status: number; raw: string; parsed: any }> {
   requireNeoSysEnv();
 
   const url = `${NEOSYS_BASE_URL}${path}`;
@@ -404,8 +401,20 @@ async function neosysPost(path: string, xmlBody: string): Promise<{ status: numb
   });
 
   const raw = await res.text();
+
+  // IMPORTANT: /nomenclatoare/articole can return VERY large XML.
+  // Parsing huge XML in-memory can crash small instances (Render free) with "heap out of memory".
+  const shouldParse = options?.parseXml !== false;
+
   let parsed: any = null;
-  try { parsed = xmlParser.parse(raw); } catch { /* ignore */ }
+  if (shouldParse) {
+    // basic guard (avoid parsing extremely large payloads)
+    const maxToParse = 5 * 1024 * 1024; // 5MB
+    if (raw.length > maxToParse) {
+      throw new Error(`NeoSys XML too large to parse safely (${raw.length} bytes). Use parseXml:false and/or add filters/batching.`);
+    }
+    try { parsed = xmlParser.parse(raw); } catch { /* ignore */ }
+  }
 
   return { status: res.status, raw, parsed };
 }
@@ -763,7 +772,7 @@ app.post("/debug/neosys/articles", async (req, res) => {
       stocGestiuneId: String(req.body?.stoc_gestiune_id ?? ""),
     });
 
-    const resp = await neosysPost("/nomenclatoare/articole", xml);
+    const resp = await neosysPost("/nomenclatoare/articole", xml, { parseXml: false });
     res.status(200).type("application/xml").send(resp.raw);
   } catch (e: any) {
     res.status(500).json({ ok: false, error: e?.message || "error" });
