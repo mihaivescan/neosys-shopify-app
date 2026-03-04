@@ -44,7 +44,10 @@ if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET || !SHOPIFY_SCOPES || !SHOPIFY_APP_U
 }
 
 // NeoSys envs are optional at boot; required only when you actually call NeoSys.
-const pool = new Pool({ connectionString: DATABASE_URL });
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
