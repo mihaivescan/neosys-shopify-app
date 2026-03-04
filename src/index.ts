@@ -157,7 +157,8 @@ type WebhookTopic =
   | "orders/create"
   | "orders/paid"
   | "orders/cancelled"
-  | "fulfillments/create"
+  | "orders/fulfilled"
+  | "orders/partially_fulfilled"
   | "products/update"
   | "products/create";
 
@@ -165,7 +166,8 @@ const WEBHOOKS: Array<{ topic: WebhookTopic; path: string }> = [
   { topic: "orders/create", path: "/webhooks/orders_create" },
   { topic: "orders/paid", path: "/webhooks/orders_paid" },
   { topic: "orders/cancelled", path: "/webhooks/orders_cancelled" },
-  { topic: "fulfillments/create", path: "/webhooks/fulfillments_create" },
+  { topic: "orders/fulfilled", path: "/webhooks/orders_fulfilled" },
+  { topic: "orders/partially_fulfilled", path: "/webhooks/orders_partially_fulfilled" },
   { topic: "products/update", path: "/webhooks/products_update" },
   { topic: "products/create", path: "/webhooks/products_create" },
 ];
@@ -627,22 +629,6 @@ ${articoleXml}
 // =====================
 // NeoSys actions
 // =====================
-async function hasNeoSysOrderMapping(shop: string, shopifyOrderId: number): Promise<boolean> {
-  const res = await pool.query(
-    `
-    select 1
-    from neosys_order_map
-    where shop = $1
-    and shopify_order_id = $2
-    limit 1
-    `,
-    [shop, shopifyOrderId]
-  );
-
-  return (res.rowCount ?? 0) > 0;
-}
-
-
 async function createNeoSysOrder(shop: string, order: any) {
   const xml = mapOrderToNeoSysXml(order);
   const resp = await neosysPost("/comanda_client", xml);
@@ -720,16 +706,8 @@ app.post(
 app.post(
   "/webhooks/orders_paid",
   ...webhookEndpoint("orders_paid", async (_topic, shop, payload) => {
-    const orderId = Number(payload?.id);
-    console.log(`[neosys] orders/paid received. shop=${shop} order_id=${orderId}`);
-
-    // Recommended: create ERP order on paid to avoid unpaid/abandoned orders.
-    if (orderId && await hasNeoSysOrderMapping(shop, orderId)) {
-      console.log(`[neosys] orders/paid ignored (already mapped). shop=${shop} order_id=${orderId}`);
-      return;
-    }
-
-    await createNeoSysOrder(shop, payload);
+    // optional: update status in NeoSys (not implemented)
+    console.log(`[neosys] orders/paid received. shop=${shop} order_id=${payload?.id}`);
   })
 );
 
@@ -742,9 +720,9 @@ app.post(
 );
 
 app.post(
-  "/webhooks/fulfillments_create",
-  ...webhookEndpoint("fulfillments_create", async (_topic, shop, payload) => {
-    console.log(`[neosys] fulfillments/create received. shop=${shop} fulfillment_id=${payload?.id}`);
+  "/webhooks/orders_fulfilled",
+  ...webhookEndpoint("orders_fulfilled", async (_topic, shop, payload) => {
+    console.log(`[neosys] orders/fulfilled received. shop=${shop} fulfillment_id=${payload?.id}`);
   })
 );
 
