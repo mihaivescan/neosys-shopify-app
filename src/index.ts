@@ -76,6 +76,8 @@ async function initDb() {
       primary key (shop, shopify_order_id)
     );
   `);
+  await pool.query(`alter table neosys_order_map add column if not exists awb text;`);
+  await pool.query(`alter table neosys_order_map add column if not exists awb_updated_at timestamptz;`);
 }
 
 // =====================
@@ -90,6 +92,20 @@ function safeCompare(a: string, b: string) {
   const bBuf = Buffer.from(b, "utf8");
   if (aBuf.length !== bBuf.length) return false;
   return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+
+function extractTrackingNumber(order: any): string | null {
+  const fulfillments = Array.isArray(order?.fulfillments) ? order.fulfillments : [];
+  for (const f of fulfillments) {
+    const tn1 = f?.tracking_number;
+    if (tn1) return String(tn1);
+    const tns = f?.tracking_numbers;
+    if (Array.isArray(tns) && tns.length) return String(tns[0]);
+    const ti = f?.tracking_info;
+    if (ti?.number) return String(ti.number);
+  }
+  return null;
 }
 
 function xmlEscape(value: any): string {
@@ -488,7 +504,7 @@ function isPricesIncludeTva(): boolean {
   return v === "true" || v === "1" || v === "yes";
 }
 
-function mapOrderToNeoSysXml(order: any): string {
+function mapOrderToNeoSysXml(order: any, opts?: { awb?: string | null; orderNumber?: string | null; paymentMethod?: string | null }): string {
   const createdAt = order?.created_at ? formatNeoSysDate(order.created_at) : "";
   const customer = order?.customer || {};
   const shipping = order?.shipping_address || order?.billing_address || {};
@@ -509,11 +525,15 @@ function mapOrderToNeoSysXml(order: any): string {
   const vat = calcVatPercent(order);
   const defaultTva = Number(NEOSYS_DEFAULT_TVA ?? vat ?? 19);
 
-  const punctLucru = String(NEOSYS_PUNCT_LUCRU ?? "depozit");
+  const punctLucru = String(NEOSYS_PUNCT_LUCRU ?? "Depozit Comat");
   const gestiune = String(NEOSYS_GESTIUNE ?? punctLucru);
 
   const currency = order?.currency || "RON";
   const note = order?.note || "";
+
+  const orderNumber = String(opts?.orderNumber ?? order?.name ?? "").trim();
+  const paymentMethod = String(opts?.paymentMethod ?? (Array.isArray(order?.payment_gateway_names) ? order.payment_gateway_names.join(", ") : (order?.gateway || "")) ?? "").trim();
+  const awb = String(opts?.awb ?? extractTrackingNumber(order) ?? "").trim();
 
   // Shopify line items
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
@@ -661,6 +681,48 @@ async function createNeoSysOrder(shop: string, order: any) {
   return parsed;
 }
 
+async function updateNeoSysAwb(shop: string, order: any, awb: string) {
+  const orderId = Number(order?.id);
+  if (!orderId) return;
+
+  const mapRes = await pool.query(
+    `select awb as existing_awb from neosys_order_map where shop=$1 and shopify_order_id=$2`,
+    [shop, orderId]
+  );
+
+  if (!mapRes.rows?.length) {
+    console.log(`[neosys] AWB update skipped (no mapping). shop=${shop} order_id=${orderId} awb=${awb}`);
+    return;
+  }
+
+  const existingAwb = mapRes.rows[0]?.existing_awb ?? null;
+  if (existingAwb && String(existingAwb).trim() === String(awb).trim()) {
+    console.log(`[neosys] AWB update skipped (already set). shop=${shop} order_id=${orderId} awb=${awb}`);
+    return;
+  }
+
+  const orderNumber = String(order?.name ?? "").trim();
+  const paymentMethod = String(
+    (Array.isArray(order?.payment_gateway_names) ? order.payment_gateway_names.join(", ") : (order?.gateway || "")) ?? ""
+  ).trim();
+
+  const xml = mapOrderToNeoSysXml(order, { awb, orderNumber, paymentMethod });
+  const resp = await neosysPost("/comanda_client", xml);
+  const parsed = parseNeoSysResult(resp.parsed);
+
+  if (!parsed.success) {
+    console.warn(`[neosys] AWB update failed. shop=${shop} order_id=${orderId} awb=${awb} http=${resp.status} err=${parsed.error}`);
+    return;
+  }
+
+  await pool.query(
+    `update neosys_order_map set awb=$3, awb_updated_at=now() where shop=$1 and shopify_order_id=$2`,
+    [shop, orderId, awb]
+  );
+
+  console.log(`[neosys] AWB updated. shop=${shop} order_id=${orderId} awb=${awb}`);
+}
+
 // =====================
 // Products pull (NeoSys nomenclatoare/articole)
 // =====================
@@ -722,7 +784,27 @@ app.post(
 app.post(
   "/webhooks/orders_fulfilled",
   ...webhookEndpoint("orders_fulfilled", async (_topic, shop, payload) => {
-    console.log(`[neosys] orders/fulfilled received. shop=${shop} fulfillment_id=${payload?.id}`);
+    const orderId = Number(payload?.id);
+    console.log(`[neosys] orders/fulfilled received. shop=${shop} order_id=${orderId}`);
+
+    if (!orderId) return;
+
+    const token = await getToken(shop);
+    if (!token) {
+      console.warn(`[neosys] orders/fulfilled ignored (no token). shop=${shop} order_id=${orderId}`);
+      return;
+    }
+
+    const orderResp = await shopifyRequest(shop, token, "GET", `/orders/${orderId}.json?status=any`);
+    const fullOrder = orderResp?.json?.order ?? payload;
+
+    const awb = extractTrackingNumber(fullOrder);
+    if (!awb) {
+      console.log(`[neosys] orders/fulfilled: no tracking yet. shop=${shop} order_id=${orderId}`);
+      return;
+    }
+
+    await updateNeoSysAwb(shop, fullOrder, awb);
   })
 );
 
